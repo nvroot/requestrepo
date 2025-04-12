@@ -8,7 +8,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Optional
 
 import asyncio
 import ip2country
@@ -35,7 +35,11 @@ from utils import (
     verify_subdomain,
     write_basic_file,
 )
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import (
+    ConnectionClosed,
+    ConnectionClosedError,
+    ConnectionClosedOK,
+)
 
 app = FastAPI(server_header=False)
 
@@ -75,8 +79,8 @@ class SessionManager:
             )
 
             return True
-        except Exception as e:
-            logger.error(f"Error adding session: {e}")
+        except Exception:
+            logger.exception("Error adding session")
             if subdomain in self.sessions:
                 self.sessions.remove(subdomain)
             return False
@@ -88,8 +92,8 @@ class SessionManager:
                 if self.pubsub:
                     await self.pubsub.unsubscribe(f"pubsub:{subdomain}")
                 self.sessions.remove(subdomain)
-        except Exception as e:
-            logger.error(f"Error removing session: {e}")
+        except Exception:
+            logger.exception("Error removing session")
 
     async def remove_all_sessions(self) -> None:
         try:
@@ -99,8 +103,8 @@ class SessionManager:
                 if channels:
                     await self.pubsub.unsubscribe(*channels)
             self.sessions.clear()
-        except Exception as e:
-            logger.error(f"Error removing all sessions: {e}")
+        except Exception:
+            logger.exception("Error removing all sessions")
             # Still clear sessions even if there's an error
             self.sessions.clear()
 
@@ -114,8 +118,8 @@ class SessionManager:
             if self.pubsub:
                 await self.pubsub.close()
                 self.pubsub = None
-        except Exception as e:
-            logger.error(f"Error in SessionManager cleanup: {e}")
+        except Exception:
+            logger.exception("Error in SessionManager cleanup")
 
 
 class RedisDependency:
@@ -163,8 +167,8 @@ async def renew_certificate() -> None:
             logger.info(f"Updated DNS for {domain} with tokens {tokens}")
 
         # await get_certificate(config.server_domain, "/app/cert/", update_dns)
-    except Exception as e:
-        logger.error(f"Error in renewer: {e}")
+    except Exception:
+        logger.exception("Error in renewer")
     finally:
         await lock.release()
         logger.info("Released lock for renewer")
@@ -252,12 +256,10 @@ async def update_dns(
         values[key].append(new_value)
 
     for key, value in values.items():
-        await pipeline.set(key, json.dumps(value), ex=config.redis_ttl)
+        await pipeline.set(key, json.dumps(value))
 
     # Store all records for this subdomain
-    await pipeline.set(
-        f"dns:{subdomain}", json.dumps(final_records), ex=config.redis_ttl
-    )
+    await pipeline.set(f"dns:{subdomain}", json.dumps(final_records))
 
     await pipeline.execute()
 
@@ -384,7 +386,7 @@ async def update_file(
     # Update index.html in the tree
     tree["index.html"] = file.model_dump()
 
-    await redis.set(f"files:{subdomain}", json.dumps(tree), ex=config.redis_ttl)
+    await redis.set(f"files:{subdomain}", json.dumps(tree))
 
     return JSONResponse({"msg": "Updated response"})
 
@@ -398,7 +400,7 @@ async def get_token(
     while await redis.exists(f"subdomain:{subdomain}"):
         subdomain = get_random_subdomain()
 
-    await redis.set(f"subdomain:{subdomain}", 1, ex=config.redis_ttl)
+    await redis.set(f"subdomain:{subdomain}", 1)
 
     await write_basic_file(subdomain, redis)
 
@@ -439,19 +441,24 @@ async def old_websocket_endpoint(
             if message["type"] == "message":
                 await websocket.send_json({"cmd": "request", "data": message["data"]})
 
-    except (WebSocketDisconnect, ConnectionClosed):
+    except (
+        WebSocketDisconnect,
+        ConnectionClosed,
+        ConnectionClosedError,
+        ConnectionClosedOK,
+    ):
         # Handle the disconnection gracefully
         pass
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+    except Exception:
+        logger.exception("Old WebSocket error")
     finally:
         # Properly clean up resources
         if pubsub:
             try:
                 await pubsub.unsubscribe(f"pubsub:{subdomain}")
                 await pubsub.close()
-            except Exception as e:
-                logger.error(f"Error closing pubsub: {e}")
+            except Exception:
+                logger.exception("Old Error closing pubsub")
 
 
 @app.websocket("/api/ws2")
@@ -459,119 +466,166 @@ async def websocket_endpoint(
     websocket: WebSocket, redis: aioredis.Redis = Depends(redis_dependency.get_redis)
 ) -> None:
     session_manager = SessionManager(websocket=websocket, redis=redis)
+    connection_accepted = False
+
     try:
         await websocket.accept()
+        connection_accepted = True
         logger.info("WebSocket connected")
 
-        # Receive initial message
         init_data = await websocket.receive_json()
-
-        # Handle both single token and multiple sessions format
-        if "cmd" in init_data and init_data["cmd"] == "register_sessions":
-            sessions = init_data.get("sessions", [])
-        else:
-            # Legacy single token format
-            sessions = [
-                {
-                    "token": init_data.get("token"),
-                    "subdomain": init_data.get("subdomain"),
-                }
-            ]
-
-        # Validate and setup sessions
-        valid_sessions = []
-        for session in sessions:
-            if await session_manager.add_session(session["token"]):
-                valid_sessions.append(session)
-            else:
-                await websocket.send_json(
-                    {"cmd": "invalid_token", "token": session["token"]}
-                )
+        sessions = _parse_initial_sessions(init_data)
+        valid_sessions = await _validate_sessions(sessions, session_manager, websocket)
 
         if not valid_sessions:
             await websocket.send_json({"error": "No valid sessions provided"})
             return
 
-        # Send initial data and subscribe to channels for each session
-        for session in valid_sessions:
-            subdomain = session_manager.get_subdomain(session["token"])
-            if subdomain:
-                # Send historical requests
-                requests = await redis.lrange(f"requests:{subdomain}", 0, -1)
-                requests = [req for req in requests if req != "{}"]
-                await websocket.send_json(
-                    {"cmd": "requests", "data": requests, "subdomain": subdomain}
-                )
+        await _send_historical_data(valid_sessions, session_manager, redis, websocket)
+        await _main_message_loop(websocket, session_manager)
 
-        # Main message loop
-        while True:
-            try:
-                # Handle WebSocket messages (use wait_for to avoid blocking)
-                try:
-                    ws_message = await asyncio.wait_for(
-                        websocket.receive_json(), timeout=0.1
-                    )
-                    logger.debug(f"Received message: {ws_message}")
-
-                    if ws_message.get("cmd") == "update_tokens":
-                        new_tokens = ws_message.get("tokens", [])
-
-                        # Remove old tokens
-                        await session_manager.remove_all_sessions()
-
-                        # Add new tokens
-                        for token in new_tokens:
-                            if not await session_manager.add_session(token):
-                                await websocket.send_json(
-                                    {"cmd": "invalid_token", "token": token}
-                                )
-                    elif ws_message.get("cmd") == "ping":
-                        await websocket.send_json({"cmd": "pong"})
-                except asyncio.TimeoutError:
-                    pass
-
-                # Handle pub/sub messages
-                if session_manager.pubsub:
-                    message = await session_manager.pubsub.get_message(timeout=0.1)
-                    if message and message["type"] == "message":
-                        channel = message["channel"]
-                        subdomain = (
-                            channel.decode().split(":")[1]
-                            if isinstance(channel, bytes)
-                            else channel.split(":")[1]
-                        )
-                        try:
-                            await websocket.send_json(
-                                {
-                                    "cmd": "request",
-                                    "data": message["data"],
-                                    "subdomain": subdomain,
-                                }
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Error sending pubsub message for {subdomain}: {e}"
-                            )
-
-                # Small delay to prevent CPU spinning
-                await asyncio.sleep(0.01)
-
-            except WebSocketDisconnect:
-                logger.info("WebSocket disconnected")
-                break
-            except ConnectionClosed:
-                logger.info("Connection closed")
-                break
-            except Exception as e:
-                logger.error(f"WebSocket error: {e}")
-                break
-
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except ConnectionClosed:
+        logger.info("Connection closed")
+    except RuntimeError as e:
+        if 'Cannot call "send" once a close message has been sent' in str(e):
+            logger.info("Cannot send to closed WebSocket")
+        else:
+            logger.exception("RuntimeError error occurred")
+    except Exception:
+        logger.exception("WebSocket error occurred")
     finally:
+        if connection_accepted:
+            await session_manager.cleanup()
         logger.info("WebSocket connection closed")
-        # Use the new cleanup method to ensure all resources are properly closed
-        await session_manager.cleanup()
+
+
+def _parse_initial_sessions(init_data: dict) -> list[dict]:
+    if init_data.get("cmd") == "register_sessions":
+        return init_data.get("sessions", [])
+    return [{"token": init_data.get("token"), "subdomain": init_data.get("subdomain")}]
+
+
+async def _validate_sessions(
+    sessions: list[dict], session_manager: SessionManager, websocket: WebSocket
+) -> list[dict]:
+    valid = []
+    for session in sessions:
+        token = session.get("token")
+        subdomain = session.get("subdomain")
+
+        if not token or not subdomain:
+            continue
+
+        if await session_manager.add_session(token):
+            valid.append(session)
+        else:
+            await websocket.send_json({"cmd": "invalid_token", "token": token})
+    return valid
+
+
+async def _send_historical_data(
+    valid_sessions: list[dict],
+    session_manager: SessionManager,
+    redis: aioredis.Redis,
+    websocket: WebSocket,
+) -> None:
+    for session in valid_sessions:
+        subdomain = session_manager.get_subdomain(session["token"])
+        if not subdomain:
+            continue
+
+        requests = await redis.lrange(f"requests:{subdomain}", 0, -1)
+        clean_requests = [req for req in requests if req != "{}"]
+
+        if clean_requests:
+            await websocket.send_json(
+                {"cmd": "requests", "data": clean_requests, "subdomain": subdomain}
+            )
+
+
+async def _main_message_loop(
+    websocket: WebSocket, session_manager: SessionManager
+) -> None:
+    """Handle both WebSocket and PubSub messages in an event-driven manner."""
+    # Create tasks for receiving messages from both sources
+    ws_receiver = asyncio.create_task(_receive_websocket_message(websocket))
+    pubsub_receiver = asyncio.create_task(_receive_pubsub_message(session_manager))
+
+    try:
+        while True:
+            # Wait for either WebSocket or PubSub message
+            done, _ = await asyncio.wait(
+                [ws_receiver, pubsub_receiver], return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in done:
+                if task is ws_receiver:
+                    # Handle WebSocket message
+                    message = task.result()
+                    if message:
+                        if message.get("cmd") == "update_tokens":
+                            await _handle_token_update(
+                                message, session_manager, websocket
+                            )
+                        elif message.get("cmd") == "ping":
+                            await websocket.send_json({"cmd": "pong"})
+
+                    # Create new WebSocket receiver task
+                    ws_receiver = asyncio.create_task(
+                        _receive_websocket_message(websocket)
+                    )
+
+                elif task is pubsub_receiver:
+                    # Handle PubSub message
+                    message = task.result()
+                    if message:
+                        await _handle_pubsub_message(message, websocket)
+
+                    # Create new PubSub receiver task
+                    pubsub_receiver = asyncio.create_task(
+                        _receive_pubsub_message(session_manager)
+                    )
+    finally:
+        # Cancel any pending tasks when exiting
+        for task in [ws_receiver, pubsub_receiver]:
+            if not task.done():
+                task.cancel()
+
+
+async def _receive_websocket_message(websocket: WebSocket) -> Optional[Dict]:
+    return await websocket.receive_json()
+
+
+async def _receive_pubsub_message(session_manager: SessionManager) -> Optional[Dict]:
+    if not session_manager.pubsub:
+        # Return None immediately if no pubsub is set up
+        return None
+
+    message = await session_manager.pubsub.get_message(ignore_subscribe_messages=True)
+
+    if message and message["type"] == "message":
+        return message
+
+
+async def _handle_token_update(
+    message: dict, session_manager: SessionManager, websocket: WebSocket
+) -> None:
+    await session_manager.remove_all_sessions()
+    for token in message.get("tokens", []):
+        if not await session_manager.add_session(token):
+            await websocket.send_json({"cmd": "invalid_token", "token": token})
+
+
+async def _handle_pubsub_message(message: dict, websocket: WebSocket) -> None:
+    channel = message["channel"]
+    channel = channel.decode() if isinstance(channel, bytes) else channel
+    subdomain = channel.split(":")[1]
+
+    await websocket.send_json(
+        {"cmd": "request", "data": message["data"], "subdomain": subdomain}
+    )
 
 
 @app.get("/api/files")
@@ -636,7 +690,7 @@ async def update_files(
         return JSONResponse({"error": "index.html cannot be deleted"})
 
     # Store the file tree
-    await redis.set(f"files:{subdomain}", json.dumps(tree), ex=config.redis_ttl)
+    await redis.set(f"files:{subdomain}", json.dumps(tree))
 
     return JSONResponse({"msg": "Updated files"})
 
@@ -773,5 +827,4 @@ async def log_request(request: Request, subdomain: str, redis: aioredis.Redis) -
 
     await redis.publish(f"pubsub:{subdomain}", data)
     idx = await redis.rpush(f"requests:{subdomain}", data) - 1
-    await redis.expire(f"requests:{subdomain}", config.redis_ttl)
     await redis.set(f"request:{subdomain}:{request_log['_id']}", idx)
